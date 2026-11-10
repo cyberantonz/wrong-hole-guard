@@ -16,8 +16,8 @@ The window context is stored as JSON, one file per session, in
   worklog      one plain-text line per exchange, newest last
 
 Haiku proposes changes after every response and this script decides which to
-keep. Haiku always sees the context rendered as labelled plain text, never the
-raw JSON. On a mismatch the check injects a confirm-first instruction and shows
+keep; Sonnet judges each new prompt. Both see the context rendered as labelled
+plain text, never the raw JSON. On a mismatch the check injects a confirm-first instruction and shows
 a warning; it never blocks (a blocked prompt is erased from the conversation).
 Files untouched for 30 days are pruned. Any failure is silent: the guard must
 never get in the way of a prompt.
@@ -33,6 +33,10 @@ from pathlib import Path
 
 STATE_DIR = Path.home() / ".claude" / "wrong-hole-guard"
 INNER = "WRONG_HOLE_GUARD_INNER"
+# The check needs judgement (Haiku let "ok, merged <other repo's issue>" through);
+# updates are cheap summaries guarded by the stability rules below.
+CHECK_MODEL = "sonnet"
+UPDATE_MODEL = "haiku"
 UPDATE_TIMEOUT_S = 90
 CHECK_TIMEOUT_S = 25
 PRUNE_AFTER_S = 30 * 86400
@@ -47,6 +51,7 @@ MAX_DESCRIPTION_CHARS = 1000
 MAX_ENTRY_CHARS = 200
 KEEP_WORKLOG = 50
 SHOW_WORKLOG = 8
+LAST_PROMPT_CHARS = 1000
 NOT_A_PROMPT = ("<task-notification", "<command-", "<local-command", "Another Claude session",
                 "<system-reminder", "[SYSTEM NOTIFICATION")
 
@@ -65,19 +70,24 @@ UPDATE_SYSTEM = (
 CHECK_SYSTEM = (
     "You judge whether a user's new message belongs to an ongoing session in one terminal "
     "window, or was probably typed into the wrong window (the user runs several sessions in "
-    "parallel, each on a different project). Follow-ups, approvals ('ok', 'merged', 'done'), "
-    "questions about the same systems, and new tasks that plausibly relate to the window's "
-    "work all FIT. Say MISMATCH only when the message is clearly about a different project, "
-    "repository or system with no visible link to the window's work. Reply with exactly one "
+    "parallel, each on a different project). The stored context may not include the most "
+    "recent exchanges, so the user's previous message is shown too: a message on the same "
+    "topic as that previous message FITS even if the stored context does not mention it yet. "
+    "Bare approvals with no new subject ('ok', 'merged', 'done'), follow-ups, questions about "
+    "the same systems, and new tasks that plausibly relate to the window's work all FIT. A "
+    "message that names a repository, issue, PR or project is judged by what it names, even "
+    "if it starts with 'ok' or 'merged'. Say MISMATCH only when the message is clearly about "
+    "a different project, repository or system with no visible link to the window's work "
+    "or to the user's previous message. Reply with exactly one "
     "line: FIT, or MISMATCH: <reason in at most 15 words>."
 )
 
 
-def haiku(system, user, timeout):
+def ask(model, system, user, timeout):
     env = dict(os.environ, **{INNER: "1"})
     try:
         out = subprocess.run(
-            ["claude", "-p", "--model", "haiku", "--no-session-persistence",
+            ["claude", "-p", "--model", model, "--no-session-persistence",
              "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
              "--tools", "", "--strict-mcp-config", "--system-prompt", system],
             input=user, capture_output=True, text=True, timeout=timeout,
@@ -128,7 +138,7 @@ def prune():
 
 
 def render(state):
-    """The context as Haiku sees it: labelled plain text."""
+    """The context as the models see it: labelled plain text."""
     worklog = "\n".join(f"- {e}" for e in state.get("worklog", [])[-SHOW_WORKLOG:]) or "- (none yet)"
     return (f"Topic: {state.get('header', '')}\n"
             f"About: {state.get('description', '')}\n"
@@ -218,7 +228,7 @@ def update(event):
         history = (f"No context yet.\n\nSession's first message:\n{first_prompt}\n\n"
                    f"First reply:\n{first_reply}\n\nLater user messages:\n{recent or '- (none)'}")
         state = {"created": int(time.time())}
-    proposal = parse_json(haiku(UPDATE_SYSTEM, f"{history}\n\nLatest user message:\n{prompt}\n\n"
+    proposal = parse_json(ask(UPDATE_MODEL, UPDATE_SYSTEM, f"{history}\n\nLatest user message:\n{prompt}\n\n"
                                                f"Latest reply:\n{reply}", UPDATE_TIMEOUT_S))
     if proposal:
         save(path, merge(state, proposal))
@@ -232,7 +242,13 @@ def check(event, wake=False):
     state = load(path)
     if not state or not state.get("header"):
         return
-    verdict = haiku(CHECK_SYSTEM, f"Window context:\n{render(state)}\n\n"
+    pairs = exchanges(event.get("transcript_path") or "")
+    if pairs and pairs[-1][0].strip() == prompt:
+        pairs = pairs[:-1]
+    # The user's previous prompt only: assistant replies often mention other
+    # projects, which made unrelated messages look related.
+    last = f"User's previous message:\n{pairs[-1][0][:LAST_PROMPT_CHARS]}\n\n" if pairs else ""
+    verdict = ask(CHECK_MODEL, CHECK_SYSTEM, f"Window context:\n{render(state)}\n\n{last}"
                                   f"New message:\n{prompt[:MAX_PROMPT_CHARS]}", CHECK_TIMEOUT_S)
     if not verdict.upper().startswith("MISMATCH"):
         return

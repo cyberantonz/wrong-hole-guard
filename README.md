@@ -9,7 +9,7 @@ know it is the wrong window, so it does the work in the wrong context: edits the
 wrong repo, closes an issue, opens a pull request, runs a deploy.
 
 wrong-hole-guard keeps a short, stable description of what each Claude Code
-window is about, and checks every new prompt against it with Claude Haiku. When
+window is about, and checks every new prompt against it with Claude Sonnet. When
 a prompt clearly belongs to a different project, the hook tells Claude to stop
 and confirm with you first. Prompts are never delayed and never blocked.
 
@@ -34,14 +34,27 @@ Two hooks, both running in the background:
 
 1. **After every response** (`Stop` hook, async), Haiku updates the window's
    context from the previous context, your last prompt and Claude's last reply.
-2. **On every prompt** (`UserPromptSubmit` hook, `asyncRewake`), Haiku judges
-   the new prompt against that context and answers `FIT` or `MISMATCH: reason`.
+2. **On every prompt** (`UserPromptSubmit` hook, `asyncRewake`), Sonnet judges
+   the new prompt against that context and your previous prompt, and answers
+   `FIT` or `MISMATCH: reason`.
    On a mismatch the hook wakes Claude with an instruction: ask the user in one
    line whether this is the right window, and take no action until they confirm.
 
-Follow-ups, approvals ("ok", "merged"), questions about the same systems and
-plausibly related new tasks count as a fit. Only a clearly different project,
-repository or system triggers the guard.
+Follow-ups, bare approvals ("ok", "merged"), questions about the same systems
+and plausibly related new tasks count as a fit. A message that names another
+repository, issue or project is judged by what it names, even if it starts with
+"ok". Only a clearly different project, repository or system triggers the guard.
+
+Your previous prompt is part of the check because the stored context is updated
+in the background and can be an exchange or two behind. Claude's replies are
+left out on purpose: they often mention other projects.
+
+Why two models: Haiku is a fine summariser but a weak judge here. On the same
+window context it let requests about another repository through most of the
+time and flagged on-topic questions; Sonnet caught the cross-repository requests
+far more reliably at similar latency through the CLI. A message phrased as a
+reply to the window's own work ("ok, merged. Looks like <other repo's issue>
+should be closed") can still pass, because it reads like a follow-up.
 
 ### The window context
 
@@ -54,8 +67,9 @@ One JSON file per session, `~/.claude/wrong-hole-guard/<session_id>.json`:
 | `worklog` | one line per exchange | append-only, last 50 kept |
 
 Haiku proposes changes and the script decides what to keep, so a session's
-topic cannot drift away in one step. Haiku always sees the context as labelled
-plain text (`Topic`, `About`, `Recent work`), never raw JSON.
+topic cannot drift away in one step. The models always see the context as
+labelled plain text (`Topic`, `About`, `Recent work`), never raw JSON. The
+models are set at the top of the script (`CHECK_MODEL`, `UPDATE_MODEL`).
 
 A new session, including after `/clear`, has no context yet: its first prompt is
 not checked, and checking starts from the second. `/compact` and `--resume` keep
@@ -104,7 +118,7 @@ cat ~/.claude/wrong-hole-guard/*.json
 
 Use `check` instead of `wake` to judge the prompt before it reaches Claude and
 inject the instruction alongside it. Nothing slips through, but every prompt
-waits for Haiku, several seconds through the CLI:
+waits for the check, several seconds through the CLI:
 
 ```json
 { "type": "command", "timeout": 30,
@@ -130,12 +144,12 @@ safety net for when you are in the wrong tab anyway.
 A `UserPromptSubmit` hook that blocks removes the prompt from the conversation,
 so you would have to retype it. Claude Code's built-in model-evaluated hook
 types (`"type": "prompt"` and `"agent"`) are not available for
-`UserPromptSubmit`, so the hook calls Haiku through the `claude` CLI itself.
+`UserPromptSubmit`, so the hook calls the model through the `claude` CLI itself.
 
 ### Does it need an API key?
 
-No. It runs `claude -p --model haiku` with whatever login your Claude Code
-already uses.
+No. It runs `claude -p --model sonnet` (check) and `--model haiku` (context
+updates) with whatever login your Claude Code already uses.
 
 ### Does it slow down my prompts?
 
@@ -151,8 +165,10 @@ To repurpose a window completely, `/clear` starts a fresh session and context.
 
 ## Limits
 
-- Each Haiku call starts a `claude -p` process: typically 4-8 s, sometimes over
+- Each model call starts a `claude -p` process: typically 3-8 s, sometimes over
   20 s. That is why both hooks run in the background.
+- A window that genuinely spans two topics gets a context that leans toward the
+  newer one, so a question about the older topic can occasionally be flagged.
 - Prompts with no visible project, such as "start from #4043", usually pass.
 - `update` rereads the session transcript each time, which is fine for normal
   sessions.
@@ -162,7 +178,7 @@ To repurpose a window completely, `/clear` starts a fresh session and context.
 
 ## Privacy
 
-Your prompts and excerpts of Claude's replies are sent to Haiku through your own
+Your prompts and excerpts of Claude's replies are sent to the models through your own
 `claude` CLI: the same provider and account your sessions already use. Context
 files stay in `~/.claude/wrong-hole-guard/` and are deleted after 30 days
 without updates.
@@ -180,7 +196,7 @@ rm -r ~/.claude/hooks/wrong-hole-guard.py ~/.claude/wrong-hole-guard
 Claude Code hook, wrong window, wrong terminal, wrong session, prompt sent to
 the wrong Claude Code session, multiple Claude Code sessions, parallel Claude
 Code agents, topic drift detection, context guard, UserPromptSubmit hook,
-asyncRewake, Stop hook, Claude Haiku classifier, tmux, iTerm2, Ghostty, git
+asyncRewake, Stop hook, LLM prompt classifier, Claude Sonnet, Claude Haiku, tmux, iTerm2, Ghostty, git
 worktrees, AI coding agent safety, confirm before acting.
 
 ## License
