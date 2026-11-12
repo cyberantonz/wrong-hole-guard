@@ -90,7 +90,11 @@ class GuardTest(unittest.TestCase):
 
     def calls(self):
         log = self.root / "calls.jsonl"
-        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        for call in calls:
+            if call["rejected"]:
+                self.fail(f"claude rejected the command line: {call['rejected']}\nargs: {call['args']}")
+        return calls
 
     def state_file(self, session="sess-1"):
         return self.state_dir / f"{session}.json"
@@ -377,10 +381,32 @@ class SafetyTests(GuardTest):
         self.assertIn("--no-session-persistence", call["args"])
         self.assertIn('{"disableAllHooks":true}', call["args"])
 
+    def test_update_command_line_is_accepted_with_its_system_prompt(self):
+        self.model_replies("haiku", proposal())
+        self.run_guard("update")
+        (call,) = self.calls()
+        self.assertEqual(call["model"], "haiku")
+        self.assertIn("worklog_entry", call["system_prompt"], "update must send its own system prompt")
+
+    def test_check_command_line_is_accepted_with_its_system_prompt(self):
+        self.write_state({"header": HEADER, "description": DESCRIPTION, "worklog": []})
+        self.model_replies("sonnet", "FIT")
+        self.run_guard("check", self.event(prompt="anything new?"))
+        (call,) = self.calls()
+        self.assertEqual(call["model"], "sonnet")
+        self.assertIn("MISMATCH", call["system_prompt"], "check must send its own system prompt")
+
     def test_garbage_stdin_is_silent(self):
         for mode in ("update", "check", "wake"):
             with self.subTest(mode=mode):
                 self.assertQuiet(self.run_guard(mode, stdin="not json"))
+
+    def test_json_that_is_not_an_object_is_silent(self):
+        for stdin in ("[]", '"x"', "42", "null"):
+            for mode in ("update", "check", "wake"):
+                with self.subTest(stdin=stdin, mode=mode):
+                    self.assertQuiet(self.run_guard(mode, stdin=stdin))
+        self.assertEqual(self.calls(), [])
 
     def test_empty_event_is_silent(self):
         for mode in ("update", "check", "wake"):
