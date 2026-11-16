@@ -34,7 +34,10 @@ SECOND_REPLY = "Fixed in MR !26 and deployed to ci-gw-1."
 
 
 def proposal(header=HEADER, description=DESCRIPTION, entry="Fixed the matcher"):
-    return json.dumps({"header": header, "description": description, "worklog_entry": entry})
+    reply = {"header": header, "description": description}
+    if entry is not None:
+        reply["worklog_entry"] = entry
+    return json.dumps(reply)
 
 
 class GuardTest(unittest.TestCase):
@@ -119,23 +122,36 @@ class GuardTest(unittest.TestCase):
 
 class UpdateTests(GuardTest):
     def test_first_update_creates_context_from_model_proposal(self):
-        self.model_replies("haiku", proposal())
+        self.model_replies("haiku", proposal(entry=None))
         result = self.run_guard("update")
         self.assertQuiet(result)
         state = self.state()
         self.assertEqual(state["header"], HEADER, "header must keep the model's wording and case")
         self.assertEqual(state["description"], DESCRIPTION)
-        self.assertEqual(self.worklog(state), ["Fixed the matcher"])
+        self.assertEqual(self.worklog(state), [], "the first run sets header and description only")
 
-    def test_first_update_seeds_from_first_exchange_and_latest_one(self):
+    def test_first_update_describes_only_the_first_exchange(self):
         self.model_replies("haiku", proposal())
         self.run_guard("update")
         (call,) = self.calls()
         self.assertEqual(call["model"], "haiku")
-        self.assertIn(FIRST_PROMPT, call["input"])
-        self.assertIn(FIRST_REPLY, call["input"])
-        self.assertIn(SECOND_PROMPT, call["input"])
-        self.assertIn(SECOND_REPLY, call["input"])
+        self.assertEqual(call["input"].count(FIRST_PROMPT), 1, "the first exchange must be sent once")
+        self.assertEqual(call["input"].count(FIRST_REPLY), 1)
+        self.assertNotIn(SECOND_PROMPT, call["input"])
+        self.assertNotIn(SECOND_REPLY, call["input"])
+
+    def test_first_and_later_updates_use_different_prompts(self):
+        self.model_replies("haiku", proposal())
+        self.run_guard("update")
+        self.run_guard("update")
+        first, later = self.calls()
+        self.assertNotEqual(
+            first["system_prompt"], later["system_prompt"], "creating the context and updating it are separate prompts"
+        )
+        self.assertNotIn("unchanged", first["system_prompt"], "nothing to keep unchanged on the first run")
+        self.assertNotIn("worklog_entry", first["system_prompt"], "the first run asks for no worklog")
+        self.assertIn("unchanged", later["system_prompt"])
+        self.assertIn("worklog_entry", later["system_prompt"])
 
     def test_worklog_survives_save_and_reload(self):
         self.model_replies("haiku", proposal(entry="first step"))
@@ -149,9 +165,11 @@ class UpdateTests(GuardTest):
         self.model_replies("haiku", proposal())
         self.run_guard("update")
         (call,) = self.calls()
-        self.assertIn(f"Topic: {HEADER}", call["input"])
-        self.assertIn(f"About: {DESCRIPTION}", call["input"])
-        self.assertIn("- earlier step", call["input"])
+        self.assertIn(HEADER, call["input"])
+        self.assertIn(DESCRIPTION, call["input"])
+        self.assertIn("earlier step", call["input"])
+        self.assertIn(SECOND_PROMPT, call["input"], "later updates describe the latest exchange")
+        self.assertIn(SECOND_REPLY, call["input"])
         self.assertNotIn('"header"', call["input"], "the model must not see raw JSON")
 
     def test_header_accepts_small_edit(self):
@@ -382,6 +400,7 @@ class SafetyTests(GuardTest):
         self.assertIn('{"disableAllHooks":true}', call["args"])
 
     def test_update_command_line_is_accepted_with_its_system_prompt(self):
+        self.write_state({"header": HEADER, "description": DESCRIPTION, "worklog": []})
         self.model_replies("haiku", proposal())
         self.run_guard("update")
         (call,) = self.calls()

@@ -40,17 +40,9 @@ from typing import Any
 STATE_DIR = Path.home() / ".claude" / "wrong-hole-guard"
 # This env value stops running this script recursively in sessions started by this script
 INNER = "WRONG_HOLE_GUARD_INNER"
-# The check needs judgement (Haiku let "ok, merged <other repo's issue>" through);
-# updates are cheap summaries guarded by the stability rules below.
-CHECK_MODEL = "sonnet"
-UPDATE_MODEL = "haiku"
-UPDATE_TIMEOUT_S = 90
-CHECK_TIMEOUT_S = 25
 PRUNE_AFTER_S = 30 * 24 * 60 * 60
 MAX_PROMPT_CHARS = 4000
 MAX_REPLY_CHARS = 3000
-SEED_PROMPTS = 10
-SEED_PROMPT_CHARS = 300
 HEADER_MIN_SIMILARITY = 0.6
 DESCRIPTION_MIN_SIMILARITY = 0.5
 MAX_HEADER_CHARS = 120
@@ -70,34 +62,71 @@ NOT_A_PROMPT = (
 MISMATCH = "mismatch"
 
 
-UPDATE_SYSTEM = (
-    "You keep the context of one terminal window running an AI coding assistant, so a later "
-    "check can tell whether a new message belongs to this window. Reply with one JSON object "
-    'and nothing else: {"header": ..., "description": ..., "worklog_entry": ...}.\n'
-    "header: the session's topic in under 12 words, naming the main project or repository. "
-    "If a current header is given, return it unchanged unless a word is plainly wrong.\n"
-    "description: 2-5 sentences on what the session works on: projects, repositories, systems, "
-    "hosts, open threads. If a current description is given, return it with at most a sentence "
-    "appended or a detail corrected; never rewrite it.\n"
-    "worklog_entry: one short line on what was done in the latest exchange, with concrete names "
-    "(issue/PR/MR numbers, hosts, files)."
-)
-CHECK_SYSTEM = (
-    "You judge whether a user's new message belongs to an ongoing session in one terminal "
-    "window, or was probably typed into the wrong window (the user runs several sessions in "
-    "parallel, each on a different project). The stored context may not include the most "
-    "recent exchanges, so the user's previous message is shown too: a message on the same "
-    "topic as that previous message FITS even if the stored context does not mention it yet. "
-    "Bare approvals with no new subject ('ok', 'merged', 'done'), follow-ups, questions about "
-    "the same systems, and new tasks that plausibly relate to the window's work all FIT. A "
-    "message that names a repository, issue, PR or project is judged by what it names, even "
-    "if it starts with 'ok' or 'merged'. Say MISMATCH only when the message is clearly about "
-    "a different project, repository or system with no visible link to the window's work "
-    "or to the user's previous message. Reply with exactly one "
-    "line: FIT, or MISMATCH: <reason in at most 15 words>."
-)
+@dataclass(frozen=True)
+class ModelQuery:
+    prompt: str
+    model: str
+    timeout: int
+
 
 Event = dict[str, Any]
+
+
+_CONTEXT_ROLE = (
+    "You keep the context of one terminal window running an AI coding assistant, so a later "
+    "check can tell whether a new message belongs to this window. "
+)
+_HEADER_SPEC = "* header: the session's topic in under 12 words, naming the main project or repository."
+_DESCRIPTION_SPEC = (
+    "* description: 2-5 sentences on what the session works on: projects, repositories, systems, hosts, open threads."
+)
+
+# Haiku is good at summarizing
+CREATE_QUERY = ModelQuery(
+    prompt=(
+        _CONTEXT_ROLE + "You get the session's first exchange; describe the session from it. "
+        'Reply with one JSON object and nothing else: {"header": ..., "description": ...}.\n'
+        f"{_HEADER_SPEC}\n"
+        f"{_DESCRIPTION_SPEC}\n"
+    ),
+    model="haiku",
+    timeout=90,
+)
+
+UPDATE_QUERY = ModelQuery(
+    prompt=(
+        _CONTEXT_ROLE + "You get the current context and the latest exchange. "
+        'Reply with one JSON object and nothing else: {"header": ..., "description": ..., '
+        '"worklog_entry": ...}.\n'
+        f"{_HEADER_SPEC} Return the current header unchanged unless a word is plainly wrong.\n"
+        f"{_DESCRIPTION_SPEC} Return the current description with at most a sentence appended or "
+        "a detail corrected; never rewrite it.\n"
+        "* worklog_entry: one short line on what was done in the latest exchange, with concrete "
+        "names (issue/PR/MR numbers, hosts, files).\n"
+    ),
+    model="haiku",
+    timeout=90,
+)
+
+CHECK_QUERY = ModelQuery(
+    prompt=(
+        "You judge whether a user's new message belongs to an ongoing session in one terminal "
+        "window, or was probably typed into the wrong window (the user runs several sessions in "
+        "parallel, each on a different project). The stored context may not include the most "
+        "recent exchanges, so the user's previous message is shown too: a message on the same "
+        "topic as that previous message FITS even if the stored context does not mention it yet. "
+        "Bare approvals with no new subject ('ok', 'merged', 'done'), follow-ups, questions about "
+        "the same systems, and new tasks that plausibly relate to the window's work all FIT. A "
+        "message that names a repository, issue, PR or project is judged by what it names, even "
+        "if it starts with 'ok' or 'merged'. Say MISMATCH only when the message is clearly about "
+        "a different project, repository or system with no visible link to the window's work "
+        "or to the user's previous message. Reply with exactly one "
+        "line: FIT, or MISMATCH: <reason in at most 15 words>."
+    ),
+    # Sonnet is good at judging
+    model="sonnet",
+    timeout=25,
+)
 
 
 @dataclass
@@ -178,9 +207,13 @@ class State:
         return state
 
     def render(self) -> str:
-        worklog = "\n".join(f"- {e}" for e in self.worklog_entries[-SHOW_WORKLOG:]) or "- (none yet)"
+        worklog = "\n".join(f"- {e}" for e in self.worklog_entries[-SHOW_WORKLOG:])
 
-        return f"Topic: {self.header}\nAbout: {self.description}\nRecent work:\n{worklog}"
+        rendered = f"Header: {self.header}\n\n"
+        rendered += f"Description: {self.description}\n\n"
+        rendered += f"Recent work:\n {worklog}\n\n"
+
+        return rendered
 
 
 @dataclass
@@ -189,7 +222,7 @@ class Exchange:
     assistant: str = field(default="")
 
 
-def ask_model(model: str, system_prompt: str, user: str, timeout: int) -> str | None:
+def ask_model(query: ModelQuery, input_value: str) -> str | None:
     env = dict(os.environ, **{INNER: "1"})
 
     try:
@@ -198,7 +231,7 @@ def ask_model(model: str, system_prompt: str, user: str, timeout: int) -> str | 
                 "claude",
                 "-p",
                 "--model",
-                model,
+                query.model,
                 "--no-session-persistence",
                 "--setting-sources",
                 "",
@@ -208,12 +241,12 @@ def ask_model(model: str, system_prompt: str, user: str, timeout: int) -> str | 
                 "",
                 "--strict-mcp-config",
                 "--system-prompt",
-                system_prompt,
+                query.prompt,
             ],
-            input=user,
+            input=input_value,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=query.timeout,
             cwd="/tmp",
             env=env,
         )
@@ -370,7 +403,7 @@ def get_conversation_from_event(event: Event) -> list[Exchange]:
     return exchanges
 
 
-def similar(a: str, b: str) -> float:
+def count_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
@@ -391,20 +424,54 @@ def find_and_parse_json(reply: str) -> Event | None:
     return value
 
 
+def get_header(state: State, proposed: str | None) -> str:
+    if proposed is None:
+        return state.header
+
+    new_header = proposed.strip()[:MAX_HEADER_CHARS]
+
+    if not new_header:
+        return state.header
+
+    if not state.header:
+        return new_header
+
+    similar = count_similarity(state.header, new_header) >= HEADER_MIN_SIMILARITY
+
+    if similar:
+        return new_header
+
+    return state.header
+
+
+def get_description(state: State, proposed: str | None) -> str:
+    if proposed is None:
+        return state.description
+
+    new_description = proposed.strip()[:MAX_DESCRIPTION_CHARS]
+
+    if not new_description:
+        return state.description
+
+    if not state.description:
+        return new_description
+
+    if new_description.startswith(state.description):
+        return new_description
+
+    similar = count_similarity(state.description, new_description) >= DESCRIPTION_MIN_SIMILARITY
+
+    if similar:
+        return new_description
+
+    return state.description
+
+
 def merge(state: State, proposal: Event) -> State:
-    new_header = str(proposal.get("header") or "").strip()[:MAX_HEADER_CHARS]
-    new_description = str(proposal.get("description") or "").strip()[:MAX_DESCRIPTION_CHARS]
+    state.header = get_header(state, proposal.get("header"))
+    state.description = get_description(state, proposal.get("description"))
+
     new_entry = str(proposal.get("worklog_entry") or "").strip()[:MAX_ENTRY_CHARS]
-
-    if new_header and (not state.header or similar(state.header, new_header) >= HEADER_MIN_SIMILARITY):
-        state.header = new_header
-
-    if new_description and (
-        not state.description
-        or new_description.startswith(state.description)
-        or similar(state.description, new_description) >= DESCRIPTION_MIN_SIMILARITY
-    ):
-        state.description = new_description
 
     if new_entry:
         worklog = state.worklog_entries
@@ -412,6 +479,7 @@ def merge(state: State, proposal: Event) -> State:
         state.worklog_entries = worklog[-KEEP_WORKLOG:]
 
     state.updated = int(time.time())
+
     return state
 
 
@@ -423,28 +491,30 @@ def update(event: Event) -> None:
     if not exchanges:
         return None
 
-    prompt, reply = exchanges[-1].user[:MAX_PROMPT_CHARS], exchanges[-1].assistant[-MAX_REPLY_CHARS:]
     state = State.from_event(event)
 
+    last_prompt = exchanges[-1].user[:MAX_PROMPT_CHARS]
+    last_reply = exchanges[-1].assistant[-MAX_REPLY_CHARS:]
+
     if state:
-        history = f"Current context:\n{state.render()}"
-    else:
-        # First run: the session's first exchange sets the topic, recent prompts fill in.
-        first_prompt = exchanges[0].user[:MAX_PROMPT_CHARS]
-        first_reply = exchanges[0].assistant[-MAX_REPLY_CHARS:]
-        recent = "\n".join(f"- {p.user[:SEED_PROMPT_CHARS]}" for p in exchanges[1:-1][-SEED_PROMPTS:])
-        history = (
-            f"No context yet.\n\nSession's first message:\n{first_prompt}\n\n"
-            f"First reply:\n{first_reply}\n\nLater user messages:\n{recent or '- (none)'}"
+        response = ask_model(
+            UPDATE_QUERY,
+            (
+                f"Current context:\n{state.render()}\n\n"
+                f"Latest user message:\n{last_prompt}\n\n"
+                f"Latest reply:\n{last_reply}"
+            ),
         )
+    else:
         state = State()
 
-    response = ask_model(
-        UPDATE_MODEL,
-        UPDATE_SYSTEM,
-        f"{history}\n\nLatest user message:\n{prompt}\n\nLatest reply:\n{reply}",
-        UPDATE_TIMEOUT_S,
-    )
+        first_prompt = exchanges[0].user[:MAX_PROMPT_CHARS]
+        first_reply = exchanges[0].assistant[-MAX_REPLY_CHARS:]
+
+        response = ask_model(
+            CREATE_QUERY,
+            (f"No context yet.\n\nSession's first message:\n{first_prompt}\n\nFirst reply:\n{first_reply}\n\n"),
+        )
 
     if response is None:
         return None
@@ -462,6 +532,7 @@ def update(event: Event) -> None:
     merged_state = merge(state, proposal)
 
     merged_state.save(path)
+    return None
 
 
 def check(event: Event, wake: bool = False) -> None:
@@ -488,15 +559,18 @@ def check(event: Event, wake: bool = False) -> None:
     if exchanges and exchanges[-1].user == prompt:
         exchanges = exchanges[:-1]
 
-    # The user's previous prompt only: assistant replies often mention other
-    # projects, which made unrelated messages look related.
-    last = f"User's previous message:\n{exchanges[-1].user[:LAST_PROMPT_CHARS]}\n\n" if exchanges else ""
+    if exchanges:
+        previous_message = exchanges[-1].user[:LAST_PROMPT_CHARS]
+    else:
+        previous_message = ""
 
     verdict = ask_model(
-        CHECK_MODEL,
-        CHECK_SYSTEM,
-        f"Window context:\n{state.render()}\n\n{last}New message:\n{prompt[:MAX_PROMPT_CHARS]}",
-        CHECK_TIMEOUT_S,
+        CHECK_QUERY,
+        (
+            f"Window context:\n{state.render()}\n\n"
+            f"User's previous message: {previous_message}\n\n"
+            f"New message:\n{prompt[:MAX_PROMPT_CHARS]}"
+        ),
     )
 
     if verdict is None:
@@ -566,6 +640,7 @@ def main() -> None:
         return None
 
     command_handler(event)
+    return None
 
 
 if __name__ == "__main__":
